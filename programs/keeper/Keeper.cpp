@@ -34,7 +34,7 @@
 
 #include <Server/HTTP/HTTPServer.h>
 #include <Server/HTTPHandlerFactory.h>
-#include <Server/KeeperReadinessHandler.h>
+#include <Server/KeeperHTTPHandlerFactory.h>
 #include <Server/PrometheusMetricsWriter.h>
 #include <Server/TCPServer.h>
 
@@ -182,6 +182,11 @@ std::string Keeper::getDefaultConfigFileName() const
     return "keeper_config.xml";
 }
 
+bool Keeper::allowTextLog() const
+{
+    return false;
+}
+
 void Keeper::handleCustomArguments(const std::string & arg, [[maybe_unused]] const std::string & value) // NOLINT
 {
     if (arg == "force-recovery")
@@ -247,11 +252,6 @@ struct KeeperHTTPContext : public IHTTPContext
     uint64_t getMaxFieldValueSize() const override
     {
         return context->getConfigRef().getUInt64("keeper_server.http_max_field_value_size", 128 * 1024);
-    }
-
-    uint64_t getMaxChunkSize() const override
-    {
-        return context->getConfigRef().getUInt64("keeper_server.http_max_chunk_size", 100_GiB);
     }
 
     Poco::Timespan getReceiveTimeout() const override
@@ -507,7 +507,7 @@ try
                     "Prometheus: http://" + address.toString(),
                     std::make_unique<HTTPServer>(
                         std::move(my_http_context),
-                        createPrometheusMainHandlerFactory(*this, config_getter(), metrics_writer, "PrometheusHandler-factory"),
+                        createPrometheusMainHandlerFactory(*this, config, metrics_writer, "PrometheusHandler-factory"),
                         server_pool,
                         socket,
                         http_params));
@@ -518,10 +518,6 @@ try
         createServer(listen_host, port_name, listen_try, [&](UInt16 port) mutable
         {
             auto my_http_context = httpContext();
-            Poco::Timespan my_keep_alive_timeout(config.getUInt("keep_alive_timeout", 10), 0);
-            Poco::Net::HTTPServerParams::Ptr my_http_params = new Poco::Net::HTTPServerParams;
-            my_http_params->setTimeout(my_http_context->getReceiveTimeout());
-            my_http_params->setKeepAliveTimeout(my_keep_alive_timeout);
 
             Poco::Net::ServerSocket socket;
             auto address = socketBindListen(socket, listen_host, port);
@@ -532,8 +528,33 @@ try
                 port_name,
                 "HTTP Control: http://" + address.toString(),
                 std::make_unique<HTTPServer>(
-                    std::move(my_http_context), createKeeperHTTPControlMainHandlerFactory(config_getter(), global_context->getKeeperDispatcher(), "KeeperHTTPControlHandler-factory"), server_pool, socket, http_params)
-                    );
+                    std::move(my_http_context),
+                    createKeeperHTTPHandlerFactory(*this, config, global_context->getKeeperDispatcher(), "KeeperHTTPHandler-factory"),
+                    server_pool,
+                    socket,
+                    http_params));
+        });
+
+        /// HTTPS control endpoints
+        port_name = "keeper_server.http_control.secure_port";
+        createServer(listen_host, port_name, listen_try, [&](UInt16 port) mutable
+        {
+            auto my_http_context = httpContext();
+
+            Poco::Net::ServerSocket socket;
+            auto address = socketBindListen(socket, listen_host, port);
+            socket.setReceiveTimeout(my_http_context->getReceiveTimeout());
+            socket.setSendTimeout(my_http_context->getSendTimeout());
+            servers->emplace_back(
+                listen_host,
+                port_name,
+                "HTTPS Control: https://" + address.toString(),
+                std::make_unique<HTTPServer>(
+                    std::move(my_http_context),
+                    createKeeperHTTPHandlerFactory(*this, config, global_context->getKeeperDispatcher(), "KeeperHTTPSHandler-factory"),
+                    server_pool,
+                    socket,
+                    http_params));
         });
     }
 
